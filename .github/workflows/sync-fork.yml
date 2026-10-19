@@ -1,3 +1,4 @@
+
 name: Sync Fork
 
 on:
@@ -12,8 +13,18 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Sync upstream repository
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Merge upstream
         run: |
-          gh repo sync "$GITHUB_REPOSITORY" --branch main
-        env:
-          GH_TOKEN: ${{ github.token }}
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/storytold/photocraft.git
+          git fetch upstream main
+
+          git merge --no-edit upstream/main
+          git push origin HEAD:main
