@@ -223,12 +223,59 @@ pub fn apply_txt2(layer: &mut TextLayer, tysh: &[u8], txt2: &E) {
     layer.sync_summary();
 }
 
-/// The frame (`Txt2 /0 /8 /0` entry) of text object `index`: its rendered frame's `/10` names it.
-fn txt2_frame(txt2: &E, index: usize) -> Option<&E> {
+/// The frame (`Txt2 /0 /8 /0` entry) of text object `index`: its rendered frame's `/10` names it
+/// (with `named`, else the frame its view names; see [`object_frame`]).
+fn txt2_frame(txt2: &E, index: usize, named: bool) -> Option<&E> {
     let object = txt2.path(&["1", "1"]).and_then(E::as_array)?.get(index)?;
-    let frame =
-        object.path(&["1", "2"]).and_then(E::as_array)?.first()?.get("6").and_then(E::as_array)?.iter().find_map(|f| f.get("10").and_then(E::as_i64))?;
-    txt2.path(&["0", "8", "0"]).and_then(E::as_array)?.get(usize::try_from(frame).ok()?)?.get("0")
+    txt2.path(&["0", "8", "0"]).and_then(E::as_array)?.get(object_frame(object, named)?)?.get("0")
+}
+
+/// The number of the frame the text object `object` is drawn in: its rendered frame's `/10`, else
+/// (with `named`) the frame its view names (`/1 /0 [ << /0 n >> ]`). Photoshop leaves the rendered
+/// strikes out for type it did not lay out (`text/path-wave-open.psd`, whose EngineData text is
+/// blank).
+fn object_frame(object: &E, named: bool) -> Option<usize> {
+    let rendered = object
+        .path(&["1", "2"])
+        .and_then(E::as_array)
+        .and_then(|s| s.first())
+        .and_then(|s| s.get("6"))
+        .and_then(E::as_array)
+        .and_then(|parts| parts.iter().find_map(|f| f.get("10").and_then(E::as_i64)));
+    let view = || named.then(|| object.path(&["1", "0"]).and_then(E::as_array).and_then(|f| f.first()).and_then(|f| f.get("0")).and_then(E::as_i64)).flatten();
+    usize::try_from(rendered.or_else(view)?).ok()
+}
+
+/// The `TySh` of `tysh` and the `Txt2` frame of its text object (`named`: see [`object_frame`]),
+/// when that object still holds `layer`'s text (an edit elsewhere leaves `Txt2` stale).
+fn layer_frame<'a>(layer: &TextLayer, tysh: &[u8], txt2: &'a E, named: bool) -> Option<(TySh, &'a E)> {
+    let t = parse_tysh(tysh)?;
+    let index = match t.text.get("TextIndex") {
+        Some(D::Integer(i)) => usize::try_from(*i).ok()?,
+        _ => return None,
+    };
+    let text = txt2.path(&["1", "1"]).and_then(E::as_array).and_then(|a| a.get(index)).and_then(|o| o.path(&["0", "0"])).and_then(E::as_str)?;
+    if text.strip_suffix('\r').unwrap_or(text).replace('\r', "\n") != layer.text {
+        return None;
+    }
+    let frame = txt2_frame(txt2, index, named)?;
+    Some((t, frame))
+}
+
+/// Puts `layer` on its path when its `Txt2` frame is type on a path (#7962): Photoshop keeps the
+/// path only there, and EngineData describes the layer as a text box the size of the path's
+/// bounds. The path is read into the `TySh` text space, the type starting where Photoshop starts
+/// it (see `psd_path`). `Ok(true)` when the layer is now path text, `Ok(false)` when its frame is
+/// no path (or `Txt2` holds another text for it), `Err` with the reason when the path can't be
+/// read: the layer then stays the box or point text EngineData describes.
+pub fn apply_txt2_path(layer: &mut TextLayer, tysh: &[u8], txt2: &E) -> Result<bool, String> {
+    let Some((_, frame)) = layer_frame(layer, tysh, txt2, true) else { return Ok(false) };
+    if crate::psd_path::frame_kind(frame) != crate::psd_path::PATH_FRAME {
+        return Ok(false);
+    }
+    let path = crate::psd_path::read(frame)?;
+    layer.shape = TextShape::Path { path, start: 0.0, flip: false };
+    Ok(true)
 }
 
 /// Places `layer` where Photoshop draws it when the text object's frame in `Txt2` is moved
@@ -240,18 +287,11 @@ fn txt2_frame(txt2: &E, index: usize) -> Option<&E> {
 /// alignment anchor. Only when the layer's `TextIndex` entry still holds the layer's text, as
 /// for [`apply_txt2`], and the frame agrees with the `TySh` `bounds`.
 pub fn apply_txt2_frame(layer: &mut TextLayer, tysh: &[u8], txt2: &E) {
-    let Some(t) = parse_tysh(tysh) else { return };
-    let Some(index) = (match t.text.get("TextIndex") {
-        Some(D::Integer(i)) => usize::try_from(*i).ok(),
-        _ => None,
-    }) else {
-        return;
-    };
-    let text = txt2.path(&["1", "1"]).and_then(E::as_array).and_then(|a| a.get(index)).and_then(|o| o.path(&["0", "0"])).and_then(E::as_str);
-    if text.is_none_or(|t| t.strip_suffix('\r').unwrap_or(t).replace('\r', "\n") != layer.text) {
+    // Type on a path: [`apply_txt2_path`] already read the path through the frame's matrix.
+    if matches!(layer.shape, TextShape::Path { .. }) {
         return;
     }
-    let Some(frame) = txt2_frame(txt2, index) else { return };
+    let Some((t, frame)) = layer_frame(layer, tysh, txt2, false) else { return };
     let m = arr_f(frame.path(&["2", "2"]));
     let matrix = if m.len() == 6 && m.iter().all(|v| v.is_finite()) { Affine { m: [m[0], m[1], m[2], m[3], m[4], m[5]] } } else { Affine::IDENTITY };
     let at = match layer.shape {
@@ -259,7 +299,7 @@ pub fn apply_txt2_frame(layer: &mut TextLayer, tysh: &[u8], txt2: &E) {
             let p = arr_f(frame.get("0"));
             if p.len() == 2 && p.iter().all(|v| v.is_finite()) { Affine::translate(p[0], p[1]) } else { Affine::IDENTITY }
         }
-        TextShape::Box { .. } => Affine::IDENTITY,
+        TextShape::Box { .. } | TextShape::Area { .. } => Affine::IDENTITY,
     };
     let to_text = matrix.mul(&at);
     if to_text == Affine::IDENTITY || to_text.determinant().abs() <= 1e-9 {
@@ -272,7 +312,7 @@ pub fn apply_txt2_frame(layer: &mut TextLayer, tysh: &[u8], txt2: &E) {
     // again would move it twice.
     let origin = match layer.shape {
         TextShape::Point | TextShape::Path { .. } => Point::new(0.0, 0.0),
-        TextShape::Box { .. } => {
+        TextShape::Box { .. } | TextShape::Area { .. } => {
             let b = engine_data(&t.text)
                 .map(|e| {
                     arr_f(
@@ -390,10 +430,44 @@ pub fn text_layer_from_tysh(data: &[u8], dpi: f32) -> Option<TextLayer> {
     // writing the TySh all agree on the visible position (#1469).
     if let Some([x, y]) = legacy_point_origin(&t) {
         let [a, b, c, d, e, f] = layer.transform.m;
-        layer.transform.m = [a, b, c, d, a * x + c * y + e, b * x + d * y + f];
+        let corrected = [a, b, c, d, a * x + c * y + e, b * x + d * y + f];
+        if corrected.iter().all(|v| v.is_finite()) {
+            layer.transform.m = corrected;
+        }
     }
     layer.sync_summary();
     Some(layer)
+}
+
+/// Refines a legacy point-text estimate after imported fonts and styles have been resolved.
+/// Uses the rendering engine's font context; an accepted `Txt2` frame stays authoritative.
+pub fn refine_legacy_point_origin(layer: &mut TextLayer, dpi: f32, engine: &mut crate::TextEngine, txt2: Option<&E>) {
+    let Some(raw) = layer.psd_raw.clone() else { return };
+    let Some(t) = parse_tysh(&raw) else { return };
+    let Some([x, y]) = legacy_point_origin(&t) else { return };
+    if !matches!(layer.shape, TextShape::Point) {
+        return;
+    }
+    let guessed = t.transform.mul(&Affine::translate(x, y));
+    if layer.transform != guessed {
+        return;
+    }
+    // `boundingBox` is the tight ink box (Photoshop writes the layout box as `bounds`), so match
+    // it with the layout's ink, not its logical box: text whose ink starts below the ascent
+    // line (`...`, `_`, lowercase) would otherwise land too low.
+    let Some(ink) = crate::render::ink_bounds(&engine.layout(layer, dpi)) else { return };
+    if !ink.iter().all(|v| v.is_finite()) {
+        return;
+    }
+    let corrected = t.transform.mul(&Affine::translate(x - ink[0], y - ink[1]));
+    if corrected.m.iter().all(|v| v.is_finite()) {
+        layer.transform = corrected;
+        // A valid frame can coincide with the initial estimate; numeric equality cannot tell
+        // whether it was used. Reapply it after the fallback so it always wins.
+        if let Some(txt2) = txt2 {
+            apply_txt2_frame(layer, &raw, txt2);
+        }
+    }
 }
 
 /// The local origin to fold into a legacy point-text transform, if present.
@@ -426,7 +500,11 @@ fn legacy_point_origin(t: &TySh) -> Option<[f64; 2]> {
     // A local bounding-box origin in the thousands and a transform origin beyond a normal canvas
     // are the signature of this old writer. Requiring that the bounding-box origin is closer to
     // the document prevents applying the correction again after export/import.
-    (bounds[0].abs().max(bounds[1].abs()) > 1024.0 && origin_distance > 4096.0 && shifted_distance < origin_distance).then_some([bounds[0], bounds[1]])
+    if !(bounds[0].abs().max(bounds[1].abs()) > 1024.0 && origin_distance > 4096.0 && shifted_distance < origin_distance) {
+        return None;
+    }
+
+    Some([bounds[0], bounds[1]])
 }
 
 fn descriptor_rect(text: &Descriptor, key: &str) -> Option<[f64; 4]> {
@@ -1135,6 +1213,20 @@ pub fn build_txt2_at(objects: &[(i32, &TextLayer)], previous: Option<&[u8]>, dpi
     let all_stubs = prev_objects.iter().all(is_stub);
     // A template is copied once per new layer, so a large one is skipped (the stub is written).
     let template = prev_objects.iter().rev().find(|o| names_one_frame(o) && fits(o, &mut { TEMPLATE_NODES }) && edited_object(o, "\r").is_some());
+    // The frame each written object is drawn in, with its layer's shape (type on a path lives
+    // only in the frame, #7962).
+    let mut frame_shapes: Vec<(usize, &TextShape)> = Vec::new();
+    // A new or rebuilt object must not be drawn in a frame another object is drawn in: the two
+    // layers would share one shape. The frames the file's objects name are taken; a free one is
+    // found past the frame list and the slots (`pad_frames` adds it).
+    let frame_count = prev.as_ref().and_then(|p| p.path(&["0", "8", "0"])).and_then(E::as_array).map(<[E]>::len);
+    let mut taken: std::collections::HashSet<usize> = prev_objects.iter().filter_map(|o| object_frame(o, true)).collect();
+    let slot_count =
+        objects.iter().filter_map(|(i, _)| usize::try_from(*i).ok().filter(|_| (0..=MAX_TEXT_INDEX).contains(i))).map(|i| i + 1).max().unwrap_or(0);
+    let mut next_free = frame_count.unwrap_or(0).max(prev_objects.len()).max(slot_count);
+    // The frame list grows only for the frames handed out here, never for a frame number an
+    // object the file kept names past its list.
+    let mut frames_needed = 0usize;
     for (index, layer) in objects {
         if !(0..=MAX_TEXT_INDEX).contains(index) {
             continue;
@@ -1170,8 +1262,28 @@ pub fn build_txt2_at(objects: &[(i32, &TextLayer)], previous: Option<&[u8]>, dpi
         // A new object (#7698): a layer the file's block has no object for (a type layer added
         // here) takes the shape of one of the file's own objects, refitted the same way, with its
         // view naming its own frame. A bare stub beside Photoshop's objects, its slot without a
-        // frame in `/0 /8 /0`, made Photoshop and Photopea refuse the file.
-        let fresh = (kept.is_none() && edited.is_none()).then(|| template.and_then(|t| new_object(t, at, &text))).flatten();
+        // frame in `/0 /8 /0`, made Photoshop and Photopea refuse the file. A slot whose object
+        // can't be refitted keeps the frame that object was drawn in.
+        let fresh = (kept.is_none() && edited.is_none())
+            .then(|| {
+                let template = template?;
+                let own = slot.and_then(|o| object_frame(o, true)).filter(|f| frame_count.is_some_and(|n| *f < n));
+                let frame = match own {
+                    Some(f) => f,
+                    None if frame_count.is_some() && taken.contains(&at) => {
+                        while taken.contains(&next_free) {
+                            next_free += 1;
+                        }
+                        if next_free > MAX_TEXT_INDEX as usize { at } else { next_free }
+                    }
+                    None => at,
+                };
+                let object = new_object(template, frame, &text)?;
+                taken.insert(frame);
+                frames_needed = frames_needed.max(frame.saturating_add(1));
+                Some(object)
+            })
+            .flatten();
         let reuse = kept.is_some() || edited.is_some();
         let unchanged = kept.is_some();
         let mut object = kept.cloned().or(edited).or(fresh).unwrap_or_else(E::dict);
@@ -1201,6 +1313,9 @@ pub fn build_txt2_at(objects: &[(i32, &TextLayer)], previous: Option<&[u8]>, dpi
             _ => model.set("6", E::Dict(vec![("0".into(), E::Array(runs))])),
         }
         object.set("0", model);
+        if let Some(frame) = object_frame(&object, true) {
+            frame_shapes.push((frame, &layer.shape));
+        }
         if slots.len() <= at {
             slots.resize(at + 1, E::dict());
         }
@@ -1211,7 +1326,24 @@ pub fn build_txt2_at(objects: &[(i32, &TextLayer)], previous: Option<&[u8]>, dpi
     // The outer dictionary keeps whatever the block held (`/98` version, block extras, …), and
     // `/1` whatever it holds beside the text objects.
     let mut outer = prev.clone().unwrap_or_else(|| E::Dict(vec![("98".into(), E::Dict(vec![("0".into(), E::Int(14))])), ("0".into(), E::dict())]));
-    pad_frames(&mut outer, slots.len());
+    pad_frames(&mut outer, slots.len().max(frames_needed));
+    // A path layer's frame holds its path; a layer taken off its path loses its path frame. An
+    // unchanged path leaves the file's frame as it was, and so does a frame the file already had
+    // more than one object drawn in (which layer's shape it should hold is unknown).
+    let mut claims: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (at, _) in &frame_shapes {
+        *claims.entry(*at).or_default() += 1;
+    }
+    if let Some(E::Array(frames)) = outer.get_mut("0").and_then(|v| v.get_mut("8")).and_then(|v| v.get_mut("0")) {
+        for (at, shape) in frame_shapes {
+            if claims.get(&at) != Some(&1) {
+                continue;
+            }
+            if let Some(entry) = frames.get_mut(at) {
+                crate::psd_path::update_frame(entry, shape);
+            }
+        }
+    }
     if fonts.len() != fonts_before
         && let Some(list @ E::Dict(_)) = outer.get_mut("0").and_then(|v| v.get_mut("1"))
     {
@@ -1335,10 +1467,7 @@ fn pad_frames(outer: &mut E, count: usize) {
     let Some(E::Array(frames)) = outer.get_mut("0").and_then(|v| v.get_mut("8")).and_then(|v| v.get_mut("0")) else { return };
     let count = count.min(MAX_TEXT_INDEX as usize + 1);
     if frames.len() < count {
-        let kind = E::Dict(vec![("4".into(), E::Int(-1)), ("7".into(), E::Bool(false))]);
-        let data = E::Dict(vec![("6".into(), E::Array(vec![E::Real(-1.0), E::Real(-1.0)])), ("11".into(), kind)]);
-        let frame = E::Dict(vec![("0".into(), E::Dict(vec![("2".into(), data)]))]);
-        frames.resize(count, frame);
+        frames.resize(count, crate::psd_path::point_frame());
     }
 }
 
@@ -1655,10 +1784,18 @@ pub fn build_engine_data(layer: &TextLayer, template: Option<E>, dpi: f32) -> E 
     if dict.get("UseFractionalGlyphWidths").is_none() {
         dict.set("UseFractionalGlyphWidths", E::Bool(true));
     }
-    let (shape_type, box_bounds) = match layer.shape {
-        // PSD path type is not written yet: the layer saves as point text.
+    let (shape_type, box_bounds) = match &layer.shape {
+        // Type on a path: the path goes into the layer's `Txt2` frame ([`build_txt2`], #7962),
+        // which only a file that already has a `Txt2` object for the layer gets; EngineData
+        // keeps it as point text, one line for readers (and files) without that frame.
         TextShape::Point | TextShape::Path { .. } => (0, None),
-        TextShape::Box { x, y, width, height } => (1, Some([x, y, x + width, y + height])),
+        TextShape::Box { x, y, width, height } => (1, Some([*x, *y, x + width, y + height])),
+        // PSD area type is not written yet: the layer saves as paragraph text over the path's
+        // bounds, so Photoshop opens it with the same text wrapping in a rectangle.
+        TextShape::Area { path } => match crate::area::path_bounds(path) {
+            Some((x0, y0, x1, y1)) => (1, Some([x0 as f32, y0 as f32, x1 as f32, y1 as f32])),
+            None => (0, None),
+        },
     };
     let mut photoshop = E::Dict(vec![("ShapeType".into(), E::Int(shape_type))]);
     match box_bounds {
@@ -1771,9 +1908,14 @@ pub fn build_tysh(layer: &TextLayer, dpi: f32, ink: Option<[f32; 4]>) -> Vec<u8>
             },
         ),
     );
-    let [l, t, r, b] = match (&layer.shape, ink) {
-        (&TextShape::Box { x, y, width, height }, _) => [x, y, x + width, y + height],
-        (_, Some(i)) => i,
+    let area = match &layer.shape {
+        TextShape::Area { path } => crate::area::path_bounds(path).map(|(x0, y0, x1, y1)| [x0 as f32, y0 as f32, x1 as f32, y1 as f32]),
+        _ => None,
+    };
+    let [l, t, r, b] = match (&layer.shape, area, ink) {
+        (&TextShape::Box { x, y, width, height }, _, _) => [x, y, x + width, y + height],
+        (_, Some(a), _) => a,
+        (_, _, Some(i)) => i,
         _ => [0.0; 4],
     };
     let rect = |cls: &str| {
@@ -1877,6 +2019,27 @@ mod nonfinite_tests {
         let s = CharStyle { baseline: FontBaseline::Subscript, ..Default::default() };
         let back = char_style(&[], &style_sheet_data(&s, 0, 1.0), &[], 1.0);
         assert_eq!(back.baseline, FontBaseline::Subscript);
+    }
+
+    #[test]
+    fn area_path_that_is_not_finite_saves_as_point_text() {
+        let path = photocraft_doc::vector::Path::new(vec![photocraft_doc::vector::Subpath::polygon(&[(0.0, 0.0), (f64::NAN, 0.0), (10.0, f64::INFINITY)])]);
+        let layer = TextLayer {
+            text: "x".into(),
+            runs: vec![TextRun { len: 1, style: CharStyle { size_pt: 12.0, ..Default::default() } }],
+            shape: TextShape::Area { path },
+            ..Default::default()
+        };
+        let out = String::from_utf8_lossy(&crate::engine_data::write(&build_engine_data(&layer, None, 72.0))).into_owned();
+        assert!(out.contains("/PointBase") && !out.contains("/BoxBounds"), "{out}");
+        assert!(!out.to_ascii_lowercase().contains("nan") && !out.to_ascii_lowercase().contains("inf"), "{out}");
+        let t = parse_tysh(&build_tysh(&layer, 72.0, None)).unwrap();
+        for key in ["bounds", "boundingBox"] {
+            let Some(D::Descriptor(d)) = t.text.get(key) else { panic!("no {key}") };
+            for side in ["Left", "Top ", "Rght", "Btom"] {
+                assert!(matches!(d.get(side), Some(D::UnitFloat { value, .. }) if value.is_finite()), "{key} {side}: {:?}", d.get(side));
+            }
+        }
     }
 
     #[test]
